@@ -244,7 +244,7 @@ def run_quantize(weights, data, imgsz, batch_size, hyp, device, no_last_layer, s
             result_eval_origin = evaluate_dataset(model_eval, val_dataloader, imgsz, data_dict, single_cls, save_dir, is_coco )
             eval_mp, eval_mr, eval_map50, eval_map= tuple(round(x, 4) for x in result_eval_origin)
             LOGGER.info(f'\n{prefix} Eval Origin  - AP: {eval_map} AP50: {eval_map50} Precision: {eval_mp} Recall: {eval_mr}')
-            report.append(["Origin", weights, eval_map, eval_map50,eval_mp, eval_mr  ])
+            report.append(["Origin", str(weights), eval_map, eval_map50,eval_mp, eval_mr  ])
 
     if no_eval_ptq:
         
