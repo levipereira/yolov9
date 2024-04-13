@@ -100,7 +100,8 @@ class QuantConcat(torch.nn.Module, quant_nn_utils.QuantInputMixin):
         inputs = [self._input_quantizer(input) for input in inputs]
         return torch.cat(inputs, self.dimension)
               
-class QuantAdd(torch.nn.Module, quant_nn_utils.QuantMixin):
+
+class QuantAdd(torch.nn.Module, quant_nn_utils.QuantInputMixin):
     def __init__(self, quantization):
         super().__init__()
         
@@ -114,8 +115,28 @@ class QuantAdd(torch.nn.Module, quant_nn_utils.QuantMixin):
             #rint(f"QAdd {self._input0_quantizer}  {self._input1_quantizer}")
             return self._input0_quantizer(x) + self._input1_quantizer(y)
         return x + y
-                
-  
+
+
+class QuantADownAvgChunk(torch.nn.Module, quant_nn_utils.QuantMixin):
+    def __init__(self):
+        super().__init__()
+        self._chunk_quantizer = quant_nn.TensorQuantizer(QuantDescriptor())
+        self.avg_pool2d = torch.nn.AvgPool2d(2, 1, 0, False, True)
+
+    def forward(self, x):
+        x = self.avg_pool2d(x)
+        x = self._chunk_quantizer(x)
+        return x.chunk(2, 1)
+
+
+def adown_quant_forward(self, x):
+    if hasattr(self, "adownchunkop"):
+        x1, x2 = self.adownchunkop(x)
+        x1 = self.cv1(x1)
+        x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+        x2 = self.cv2(x2)
+        return torch.cat((x1, x2), 1)
+
 
 class disable_quantization:
     def __init__(self, model):
@@ -158,7 +179,24 @@ def have_quantizer(module):
 
 # Initialize PyTorch Quantization
 def initialize():
-    quant_modules.initialize( )
+    disable_list = [
+        # "Conv1d",
+        "Conv2d",
+        # "Conv3d",
+        # "ConvTranspose1d",
+        # "ConvTranspose2d",
+        # "ConvTranspose3d",
+        # "Linear",
+        # "LSTM",
+        # "LSTMCell",
+        # "AvgPool1d",
+        # "AvgPool2d",
+        # "AvgPool3d",
+        # "AdaptiveAvgPool1d",
+        # "AdaptiveAvgPool2d",
+        # "AdaptiveAvgPool3d",
+    ]
+    quant_modules.initialize(disable_list)
     quant_desc_input = QuantDescriptor(calib_method="histogram")
     quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
     quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
@@ -181,6 +219,8 @@ def transfer_torch_to_quantization(nninstance : torch.nn.Module, quantmodule):
     def __init__(self):
         if self.__class__.__name__ == 'QuantConcat': 
            self.__init__()
+        elif self.__class__.__name__ == 'QuantAvgPool2d':
+            self.__init__(nninstance.kernel_size, nninstance.stride, nninstance.padding, nninstance.ceil_mode, nninstance.count_include_pad)
         elif isinstance(self, quant_nn_utils.QuantInputMixin):
             quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
             self.init_quantizer(quant_desc_input)
@@ -239,6 +279,10 @@ def replace_to_quantization_module(model : torch.nn.Module, ignore_policy : Unio
                     continue
                     
                 module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+                if name != 'conv':
+                # if True:
+                    print(name, '->', module._modules[name])
+                    print('*' * 50)
 
     recursive_and_replace_module(model)
 
@@ -302,14 +346,24 @@ def apply_custom_rules_to_quantizer(model : torch.nn.Module, export_onnx : Calla
                 module.repaddop._input0_quantizer = major
                 module.repaddop._input1_quantizer = major
 
+        if module.__class__.__name__ == 'ADown':
+            module.cv1.conv._input_quantizer = module.adownchunkop._chunk_quantizer
+
+
 def replace_custom_module_forward(model):
     for name, module  in model.named_modules():
-            if module.__class__.__name__ == "RepNBottleneck":
-                if module.add:
-                    if not hasattr(module, "repaddop"):
-                        #print(f"Add QuantAdd to {name}")
-                        module.repaddop = QuantAdd(module.add)
-                    module.__class__.forward = repnbottleneck_quant_forward
+
+        if module.__class__.__name__ == "ADown":
+            if not hasattr(module, "adownchunkop"):
+                print(f"Add ADownQuantChunk to {name}")
+                module.adownchunkop = QuantADownAvgChunk()
+            module.__class__.forward = adown_quant_forward
+
+        if module.__class__.__name__ == "RepNBottleneck":
+            if module.add:
+                if not hasattr(module, "repaddop"):
+                    #print(f"Add QuantAdd to {name}")
+                    module.repaddop = QuantAdd(module.add)
     
 
 def calibrate_model(model : torch.nn.Module, dataloader, device, num_batch=25):
