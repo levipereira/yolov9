@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.experimental import attempt_load, End2End, Yolo_TRT
+from models.experimental import attempt_load, End2End, End2End_TRT, End2End_Mask_TRT
 from models.yolo import ClassificationModel, Detect, DDetect, DualDetect, DualDDetect, DetectionModel, SegmentationModel
 from utils.dataloaders import LoadImages
 from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check_requirements, check_version,
@@ -141,9 +141,11 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
     return f, model_onnx
     
 @try_export
-def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, labels, prefix=colorstr('ONNX END2END:')):
+def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, labels, mask_resolution, pooler_scale, sampling_ratio, prefix=colorstr('ONNX END2END_TRT:')):
+    det_model=True
     if not isinstance(model, DetectionModel) or isinstance(model, SegmentationModel):
-        raise RuntimeError("Model not supported. Only Detection Models can be exported with End2End functionality.")
+       det_model=False ## segmentation Model
+
     # YOLO ONNX export
     check_requirements('onnx')
     import onnx
@@ -153,16 +155,34 @@ def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, 
 
     dynamic_axes = {'images': {0 : 'batch', 2: 'height', 3:'width'}, } # variable length axes
 
-    output_axes = {
-                    'num_dets': {0: 'batch'},
-                    'det_boxes': {0: 'batch'},
-                    'det_scores': {0: 'batch'},
-                    'det_classes': {0: 'batch'},
-                }
+    if det_model:
+        output_axes = {
+                        'num_dets': {0: 'batch'},
+                        'det_boxes': {0: 'batch'},
+                        'det_scores': {0: 'batch'},
+                        'det_classes': {0: 'batch'},
+                        'det_indices': {0: 'batch'},
+                    }
+    else:
+        output_axes = {
+                        'num_dets': {0: 'batch'},
+                        'det_boxes': {0: 'batch'},
+                        'det_scores': {0: 'batch'},
+                        'det_classes': {0: 'batch'},
+                        'det_masks': {0: 'batch'},
+                    }        
+  
     dynamic_axes.update(output_axes)
-    model = Yolo_TRT(model, topk_all, iou_thres, conf_thres, None ,device, labels)
+    if det_model:
+        model = End2End_TRT(model, topk_all, iou_thres, conf_thres, None ,device, labels)
+    else:
+        model = End2End_Mask_TRT(model, topk_all, iou_thres, conf_thres, labels, mask_resolution, None ,device, pooler_scale, sampling_ratio )
 
-    output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes', 'det_indices'] 
+    if det_model:
+        output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes', 'det_indices'] 
+    else:
+        output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes', 'det_masks'] 
+
     shapes = [ batch_size, 1,  batch_size,  topk_all, 4,
                batch_size,  topk_all,  batch_size,  topk_all, batch_size,  topk_all]
 
@@ -589,6 +609,9 @@ def run(
         topk_all=100,  # TF.js NMS: topk for all classes to keep
         iou_thres=0.45,  # TF.js NMS: IoU threshold
         conf_thres=0.25,  # TF.js NMS: confidence threshold
+        mask_resolution=56,
+        pooler_scale=0.25,
+        sampling_ratio=0,
 ):
     t = time.time()
     include = [x.lower() for x in include]  # to lowercase
@@ -645,7 +668,7 @@ def run(
         f[2], _ = export_onnx_end2end(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, len(labels))
     if onnx_trt:
         labels = model.names
-        f[2], _ = export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, len(labels))
+        f[2], _ = export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, len(labels), mask_resolution, pooler_scale, sampling_ratio )
     if xml:  # OpenVINO
         f[3], _ = export_openvino(file, metadata, half)
     if coreml:  # CoreML

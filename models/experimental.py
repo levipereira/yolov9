@@ -191,6 +191,53 @@ class TRT_YOLO_NMS(torch.autograd.Function):
         nums, boxes, scores, classes, det_indices = out
         return nums, boxes, scores, classes, det_indices
 
+class TRT_ROIAlign(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        X,
+        rois,
+        batch_indices,
+        coordinate_transformation_mode= 1,
+        mode=1,  # 1- avg pooling  / 0 - max pooling
+        output_height=56,
+        output_width=56,
+        sampling_ratio=0,
+        spatial_scale=0.25,
+    ):
+        device = rois.device
+        dtype = rois.dtype
+        N, C, H, W = X.shape
+        num_rois = rois.shape[0]
+        return torch.randn((num_rois, C, output_height, output_width), device=device, dtype=dtype)
+
+    @staticmethod
+    def symbolic(
+        g,
+        X,
+        rois,
+        batch_indices,
+        coordinate_transformation_mode=1,
+        mode=1,
+        output_height=56,
+        output_width=56,
+        sampling_ratio=0,
+        spatial_scale=0.25,
+    ):
+        return g.op(
+            "TRT::ROIAlign_TRT",
+            X,
+            rois,
+            batch_indices,
+            coordinate_transformation_mode_i=coordinate_transformation_mode,
+            mode_i=mode,
+            output_height_i=output_height,
+            output_width_i=output_width,
+            sampling_ratio_i=sampling_ratio,
+            spatial_scale_f=spatial_scale,
+        )
+    
+    
 class ONNX_ORT(nn.Module):
     '''onnx module with ONNX-Runtime NMS operation.'''
     def __init__(self, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=640, device=None, n_classes=80):
@@ -206,9 +253,7 @@ class ONNX_ORT(nn.Module):
         self.n_classes=n_classes
 
     def forward(self, x):
-        ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
-        ## thanks https://github.com/thaitc-hust
-        if isinstance(x, list):  ## yolov9-c.pt and yolov9-e.pt return list
+        if isinstance(x, list):  ## remove auxiliary branch
             x = x[1]
         x = x.permute(0, 2, 1)
         bboxes_x = x[..., 0:1]
@@ -249,9 +294,7 @@ class ONNX_TRT(nn.Module):
         self.n_classes=n_classes
 
     def forward(self, x):
-        ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
-        ## thanks https://github.com/thaitc-hust
-        if isinstance(x, list):  ## yolov9-c.pt and yolov9-e.pt return list
+        if isinstance(x, list):  ## remove auxiliary branch
             x = x[1]
         x = x.permute(0, 2, 1)
         bboxes_x = x[..., 0:1]
@@ -318,7 +361,7 @@ class End2End(nn.Module):
         x = self.end2end(x)
         return x
 
-class Yolo_TRT(nn.Module):
+class End2End_TRT(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
     def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80):
         super().__init__()
@@ -334,6 +377,91 @@ class Yolo_TRT(nn.Module):
         x = self.model(x)
         x = self.end2end(x)
         return x
+    
+
+
+class End2End_Mask_TRT(nn.Module):
+    """onnx module with ONNX-TensorRT NMS operation."""
+
+    def __init__(
+        self,
+        max_obj=100,
+        iou_thres=0.45,
+        score_thres=0.25,
+        n_classes=80,
+        mask_resolution=56,
+        max_wh=None,
+        device=None,
+        pooler_scale=0.25,
+        sampling_ratio=0,
+    ):
+        super().__init__()
+        assert max_wh is None
+        device = device if device else torch.device('cpu')
+        self.max_obj = max_obj
+        self.background_class = -1,
+        self.box_coding = 1,
+        self.iou_threshold = iou_thres
+        self.max_obj = max_obj
+        self.plugin_version = '1'
+        self.score_activation = 0
+        self.score_threshold = score_thres
+        self.n_classes=n_classes
+        self.mask_resolution = mask_resolution
+        self.pooler_scale = pooler_scale
+        self.sampling_ratio = sampling_ratio
+        #self.image_size = 640
+        #self.background_class = (-1,)
+       
+    def forward(self, x):
+        if isinstance(x, list):   ## remove auxiliary branch
+            x = x[1]
+        bboxes_x = x[0][..., 0:1]
+        bboxes_y = x[0][..., 1:2]
+        bboxes_w = x[0][..., 2:3]
+        bboxes_h = x[0][..., 3:4]
+        bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
+        bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
+        obj_conf = x[0][..., 4:]
+        scores = obj_conf
+
+        proto = x[1]
+        batch_size, nm, proto_h, proto_w = proto.shape
+        total_object = batch_size * self.max_obj
+        masks = x[0][:, :, 5 + self.nc : 5 + self.n_classes + nm]
+
+        num_det, det_boxes, det_scores, det_classes, det_indices = TRT_YOLO_NMS.apply(bboxes, scores, self.background_class, self.box_coding,
+                                                                    self.iou_threshold, self.max_obj,
+                                                                    self.plugin_version, self.score_activation,
+                                                                    self.score_threshold)
+        
+        batch_indices = torch.ones_like(det_indices) * torch.arange(batch_size, device=self.device, dtype=torch.int32).unsqueeze(1)
+        batch_indices = batch_indices.view(total_object).to(torch.long)
+        det_indices = det_indices.view(total_object).to(torch.long)
+        det_masks = masks[batch_indices, det_indices]
+
+
+        pooled_proto = TRT_ROIAlign.apply(  proto,
+                                            det_boxes.view(total_object, 4),
+                                            batch_indices,
+                                            1,
+                                            1,
+                                            self.mask_resolution,
+                                            self.mask_resolution,
+                                            self.sampling_ratio,
+                                            self.pooler_scale,
+                                        )
+        pooled_proto = pooled_proto.view(
+            total_object, nm, self.mask_resolution * self.mask_resolution
+        )
+
+        masks = (
+            torch.matmul(det_masks.unsqueeze(dim=1), pooled_proto)
+            .sigmoid()
+            .view(batch_size, self.max_obj, self.mask_resolution * self.mask_resolution)
+        )
+
+        return num_det, det_boxes, det_scores, det_classes, masks
     
 
 def attempt_load(weights, device=None, inplace=True, fuse=True):
