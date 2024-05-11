@@ -153,7 +153,7 @@ class TRT_YOLO_NMS(torch.autograd.Function):
         plugin_version="1",
         score_activation=0,
         score_threshold=0.25,
-        class_agnostic = False,
+        class_agnostic=0,
     ):
 
         batch_size, num_boxes, num_classes = scores.shape
@@ -174,8 +174,8 @@ class TRT_YOLO_NMS(torch.autograd.Function):
                  max_output_boxes=100,
                  plugin_version="1",
                  score_activation=0,
-                 class_agnostic=False,
-                 score_threshold=0.25):
+                 score_threshold=0.25,
+                 class_agnostic=0):
         out = g.op("TRT::YOLO_NMS_TRT",
                    boxes,
                    scores,
@@ -185,7 +185,7 @@ class TRT_YOLO_NMS(torch.autograd.Function):
                    max_output_boxes_i=max_output_boxes,
                    plugin_version_s=plugin_version,
                    score_activation_i=score_activation,
-                   class_agnostic_b=class_agnostic,
+                   class_agnostic_i=class_agnostic,
                    score_threshold_f=score_threshold,
                    outputs=5)
         nums, boxes, scores, classes, det_indices = out
@@ -360,17 +360,23 @@ class End2End(nn.Module):
         x = self.model(x)
         x = self.end2end(x)
         return x
+    
+
 
 class End2End_TRT(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
-    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80):
+    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, mask_resolution=56, pooler_scale=0.25, sampling_ratio=0, max_wh=None, device=None, n_classes=80, is_det_model=True):
         super().__init__()
         device = device if device else torch.device('cpu')
         assert isinstance(max_wh,(int)) or max_wh is None
         self.model = model.to(device)
         self.model.model[-1].end2end = True
-        self.patch_model = ONNX_YOLO_TRT 
-        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes)
+        if is_det_model:
+            self.patch_model = ONNX_YOLO_TRT 
+            self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes)
+        else:
+            self.patch_model = ONNX_YOLO_MASK_TRT 
+            self.end2end = self.patch_model(max_obj, iou_thres, score_thres, mask_resolution, pooler_scale, sampling_ratio, max_wh, device, n_classes) 
         self.end2end.eval()
 
     def forward(self, x):
@@ -380,7 +386,7 @@ class End2End_TRT(nn.Module):
     
 
 
-class End2End_Mask_TRT(nn.Module):
+class ONNX_YOLO_MASK_TRT(nn.Module):
     """onnx module with ONNX-TensorRT NMS operation."""
 
     def __init__(
@@ -388,16 +394,16 @@ class End2End_Mask_TRT(nn.Module):
         max_obj=100,
         iou_thres=0.45,
         score_thres=0.25,
-        n_classes=80,
         mask_resolution=56,
-        max_wh=None,
-        device=None,
         pooler_scale=0.25,
         sampling_ratio=0,
+        max_wh=None,
+        device=None,
+        n_classes=80
     ):
         super().__init__()
-        assert max_wh is None
-        device = device if device else torch.device('cpu')
+        assert isinstance(max_wh,(int)) or max_wh is None
+        self.device = device if device else torch.device('cpu')
         self.max_obj = max_obj
         self.background_class = -1,
         self.box_coding = 1,
@@ -416,20 +422,21 @@ class End2End_Mask_TRT(nn.Module):
     def forward(self, x):
         if isinstance(x, list):   ## remove auxiliary branch
             x = x[1]
-        bboxes_x = x[0][..., 0:1]
-        bboxes_y = x[0][..., 1:2]
-        bboxes_w = x[0][..., 2:3]
-        bboxes_h = x[0][..., 3:4]
+        det=x[0]
+        proto=x[1]
+        det = det.permute(0, 2, 1)
+
+        bboxes_x = det[..., 0:1]
+        bboxes_y = det[..., 1:2]
+        bboxes_w = det[..., 2:3]
+        bboxes_h = det[..., 3:4]
         bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
         bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
-        obj_conf = x[0][..., 4:]
-        scores = obj_conf
-
-        proto = x[1]
+        scores = det[..., 4: 4 + self.n_classes]
+       
         batch_size, nm, proto_h, proto_w = proto.shape
         total_object = batch_size * self.max_obj
-        masks = x[0][:, :, 5 + self.nc : 5 + self.n_classes + nm]
-
+        masks = det[..., 4 + self.n_classes : 4 + self.n_classes + nm]
         num_det, det_boxes, det_scores, det_classes, det_indices = TRT_YOLO_NMS.apply(bboxes, scores, self.background_class, self.box_coding,
                                                                     self.iou_threshold, self.max_obj,
                                                                     self.plugin_version, self.score_activation,
@@ -446,22 +453,22 @@ class End2End_Mask_TRT(nn.Module):
                                             batch_indices,
                                             1,
                                             1,
-                                            self.mask_resolution,
-                                            self.mask_resolution,
+                                            int(proto_h),
+                                            int(proto_w),
                                             self.sampling_ratio,
                                             self.pooler_scale,
                                         )
         pooled_proto = pooled_proto.view(
-            total_object, nm, self.mask_resolution * self.mask_resolution
+            total_object, nm, int(proto_h) * int(proto_w)
         )
 
-        masks = (
+        det_masks = (
             torch.matmul(det_masks.unsqueeze(dim=1), pooled_proto)
             .sigmoid()
-            .view(batch_size, self.max_obj, self.mask_resolution * self.mask_resolution)
+            .view(batch_size, self.max_obj, int(proto_h) * int(proto_w))
         )
 
-        return num_det, det_boxes, det_scores, det_classes, masks
+        return num_det, det_boxes, det_scores, det_classes, det_masks
     
 
 def attempt_load(weights, device=None, inplace=True, fuse=True):

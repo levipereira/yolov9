@@ -21,8 +21,8 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.experimental import attempt_load, End2End, End2End_TRT, End2End_Mask_TRT
-from models.yolo import ClassificationModel, Detect, DDetect, DualDetect, DualDDetect, DetectionModel, SegmentationModel
+from models.experimental import attempt_load, End2End, End2End_TRT
+from models.yolo import ClassificationModel, Detect, DDetect, DualDetect, DualDDetect, DetectionModel, SegmentationModel, DSegment
 from utils.dataloaders import LoadImages
 from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check_requirements, check_version,
                            check_yaml, colorstr, file_size, get_default_args, print_args, url2file, yaml_save)
@@ -141,57 +141,65 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
     return f, model_onnx
     
 @try_export
-def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, labels, mask_resolution, pooler_scale, sampling_ratio, prefix=colorstr('ONNX END2END_TRT:')):
-    det_model=True
-    if not isinstance(model, DetectionModel) or isinstance(model, SegmentationModel):
-       det_model=False ## segmentation Model
+def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, device, labels, mask_resolution, pooler_scale, sampling_ratio, prefix=colorstr('ONNX TRT:')):
+    is_det_model=True
+    if isinstance(model, SegmentationModel):
+        is_det_model=False
 
+    ## force SegmentationModel  
+    env_is_det_model = os.getenv("is_det_model")
+    if env_is_det_model == "0":
+        is_det_model = False
     # YOLO ONNX export
     check_requirements('onnx')
     import onnx
     LOGGER.info(f'\n{prefix} starting export with onnx {onnx.__version__}...')
-    f = os.path.splitext(file)[0] + "-end2end.onnx"
+    f = os.path.splitext(file)[0] + "-trt.onnx"
     batch_size = 'batch'
+    d = {
+        'stride': int(max(model.stride)),
+        'names': model.names,
+        'TRT Compatibility': '8.5.3 or above',
+        'TRT Plugins': 'YoloNMS' if is_det_model else 'YoloNMS, ROIAlign'
+        }
 
     dynamic_axes = {'images': {0 : 'batch', 2: 'height', 3:'width'}, } # variable length axes
 
-    if det_model:
-        output_axes = {
-                        'num_dets': {0: 'batch'},
-                        'det_boxes': {0: 'batch'},
-                        'det_scores': {0: 'batch'},
-                        'det_classes': {0: 'batch'},
-                        'det_indices': {0: 'batch'},
-                    }
-    else:
-        output_axes = {
-                        'num_dets': {0: 'batch'},
-                        'det_boxes': {0: 'batch'},
-                        'det_scores': {0: 'batch'},
-                        'det_classes': {0: 'batch'},
-                        'det_masks': {0: 'batch'},
-                    }        
-  
-    dynamic_axes.update(output_axes)
-    if det_model:
-        model = End2End_TRT(model, topk_all, iou_thres, conf_thres, None ,device, labels)
-    else:
-        model = End2End_Mask_TRT(model, topk_all, iou_thres, conf_thres, labels, mask_resolution, None ,device, pooler_scale, sampling_ratio )
+    output_axes = {
+                    'num_dets': {0: 'batch'},
+                    'det_boxes': {0: 'batch'},
+                    'det_scores': {0: 'batch'},
+                    'det_classes': {0: 'batch'},
+                 }
 
-    if det_model:
+    if is_det_model:
+        output_axes['det_indices'] = {0: 'batch'}
         output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes', 'det_indices'] 
+        shapes = [ batch_size, 1,  
+                batch_size,  topk_all, 4,
+                batch_size,  topk_all,  
+                batch_size,  topk_all, 
+                batch_size,  topk_all]
+        
     else:
+        output_axes['det_masks'] = {0: 'batch'}
         output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes', 'det_masks'] 
+        shapes = [ batch_size, 1,  
+                batch_size,  topk_all, 4,
+                batch_size,  topk_all,  
+                batch_size,  topk_all, 
+                batch_size,  topk_all, mask_resolution * mask_resolution]
 
-    shapes = [ batch_size, 1,  batch_size,  topk_all, 4,
-               batch_size,  topk_all,  batch_size,  topk_all, batch_size,  topk_all]
+    dynamic_axes.update(output_axes)
+    
+    model = End2End_TRT(model, topk_all, iou_thres, conf_thres, mask_resolution, pooler_scale, sampling_ratio, None ,device, labels, is_det_model )
 
     torch.onnx.export(model, 
                           im, 
                           f, 
                           verbose=False, 
                           export_params=True,       # store the trained parameter weights inside the model file
-                          opset_version=12, 
+                          opset_version=14, 
                           do_constant_folding=True, # whether to execute constant folding for optimization
                           input_names=['images'],
                           output_names=output_names,
@@ -200,23 +208,38 @@ def export_onnx_trt(model, im, file, simplify, topk_all, iou_thres, conf_thres, 
     # Checks
     model_onnx = onnx.load(f)  # load onnx model
     onnx.checker.check_model(model_onnx)  # check onnx model
+
+    for k, v in d.items():
+        meta = model_onnx.metadata_props.add()
+        meta.key, meta.value = k, str(v)
+        
+
     for i in model_onnx.graph.output:
         for j in i.type.tensor_type.shape.dim:
             j.dim_param = str(shapes.pop(0))
 
-    if simplify:
-        try:
-            import onnxsim
+    check_requirements('onnxsim')
+    try:
+        import onnxsim
+        LOGGER.info(f'\n{prefix} Starting to simplify ONNX...')
+        model_onnx, check = onnxsim.simplify(model_onnx)
+        assert check, 'assert check failed'
+    except Exception as e:
+        LOGGER.info(f'\n{prefix} Simplifier failure: {e}')
 
-            print('\nStarting to simplify ONNX...')
-            model_onnx, check = onnxsim.simplify(model_onnx)
-            assert check, 'assert check failed'
-        except Exception as e:
-            print(f'Simplifier failure: {e}')
+    onnx.save(model_onnx,f)
+    
+    check_requirements('onnx_graphsurgeon')
+    LOGGER.info(f'\n{prefix} Starting to cleanup ONNX using onnx_graphsurgeon...')
+    try:
+        import onnx_graphsurgeon as gs
 
-        # print(onnx.helper.printable_graph(onnx_model.graph))  # print a human readable model
-        onnx.save(model_onnx,f)
-        print('ONNX export success, saved as %s' % f)
+        graph = gs.import_onnx(model_onnx)
+        graph = graph.cleanup().toposort()
+        model_onnx = gs.export_onnx(graph)
+    except Exception as e:
+        LOGGER.info(f'\n{prefix} Cleanup failure: {e}')
+
     return f, model_onnx
 
 
@@ -627,7 +650,6 @@ def run(
         assert device.type != 'cpu' or coreml, '--half only compatible with GPU export, i.e. use --device 0'
         assert not dynamic, '--half not compatible with --dynamic, i.e. use either --half or --dynamic but not both'
     model = attempt_load(weights, device=device, inplace=True, fuse=True)  # load FP32 model
-
     # Checks
     imgsz *= 2 if len(imgsz) == 1 else 1  # expand
     if optimize:
